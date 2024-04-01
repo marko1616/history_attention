@@ -1,4 +1,4 @@
-import torch, json
+import torch, json, os
 from torch.nn.functional import softmax
 from rich import print
 from rich.progress import Progress
@@ -6,9 +6,9 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 #from accelerate import dispatch_model, infer_auto_device_map
 
-#model_path = r"J:\AI\models\chinese-alpaca-2-13b"
-model_path = r"J:\AI\models\gemma-7b-it"
-lora_path = r"J:\AI\models\gemma-7b-it-lora\chinese-prelora"
+model_path = "/root/autodl-tmp/chinese-alpaca-2-13b"
+#model_path = r"J:\AI\models\gemma-7b-it"
+#lora_path = r"J:\AI\models\gemma-7b-it-lora\chinese-prelora"
 add_persent = 0.3
 batch_size = 4
 
@@ -27,51 +27,39 @@ def get_base(prompt,y):
     y_ids = tokenizer.encode(y)
     probsum = 0
     progress_task = progress.add_task("[cyan]具体对话处理进度(准线)", total=len(y_ids))
+
+    prompt_encoded_len = len(tokenizer.encode(prompt))
+    encoded_input = tokenizer.encode(prompt + y, return_tensors="pt").to("cuda")
+
     for y_index, y_id in enumerate(y_ids):
-        out = softmax(model.generate(input_ids=tokenizer.encode(prompt+y[:y_index],return_tensors="pt").to("cuda:1"),
+        out = softmax(model.generate(input_ids=encoded_input[0,:prompt_encoded_len+y_index].unsqueeze(0),
                             do_sample=False,
                             output_scores=True,
                             return_dict_in_generate = True,
                             max_new_tokens=1
-                            ).scores[0].squeeze(0))
+                            ).scores[0].squeeze(0),dim=0)
         probsum += out[y_id]
         progress.update(progress_task, advance=1)
     progress.remove_task(progress_task)
     print(f"概率和:{probsum}")
     return probsum
 
-def get_diff_batch(base,prompt,y):
-    y_ids = tokenizer.encode(y,add_special_tokens=False)
-    probsum = 0
-    progress_task = progress.add_task("[cyan]具体对话处理进度", total=len(y_ids))
-    for y_index, y_id in enumerate(y_ids):
-        with torch.no_grad():
-            out = softmax(model.generate(input_ids=tokenizer.encode(prompt+y[:y_index],return_tensors="pt").to("cuda:1"),
-                                do_sample=False,
-                                output_scores=True,
-                                return_dict_in_generate = True,
-                                max_new_tokens=1
-                                ).scores[0].squeeze(0))
-        probsum += out[y_id]
-        progress.update(progress_task, advance=1)
-    progress.remove_task(progress_task)
-    print(f"概率和:{probsum}")
-    probdiff = base-probsum
-    print(f"概率和差分(越大越有用):{probdiff}")
-    return probdiff, probsum
-
 def get_diff(base:float,prompt:str,y:str):
     y_ids = tokenizer.encode(y,add_special_tokens=False)
     probsum = 0
     progress_task = progress.add_task("[cyan]具体对话处理进度", total=len(y_ids))
+
+    prompt_encoded_len = len(tokenizer.encode(prompt))
+    encoded_input = tokenizer.encode(prompt + y, return_tensors="pt").to("cuda")
+
     for y_index, y_id in enumerate(y_ids):
         with torch.no_grad():
-            out = softmax(model.generate(input_ids=tokenizer.encode(prompt+y[:y_index],return_tensors="pt").to("cuda:1"),
+            out = softmax(model.generate(input_ids=encoded_input[0,:prompt_encoded_len+y_index].unsqueeze(0),
                                 do_sample=False,
                                 output_scores=True,
                                 return_dict_in_generate = True,
                                 max_new_tokens=1
-                                ).scores[0].squeeze(0))
+                                ).scores[0].squeeze(0),dim=0)
         probsum += out[y_id]
         progress.update(progress_task, advance=1)
     progress.remove_task(progress_task)
@@ -82,7 +70,10 @@ def get_diff(base:float,prompt:str,y:str):
 
 print("加载LLM")
 model = AutoModelForCausalLM.from_pretrained(model_path,
-                                             torch_dtype=torch.float16)
+                                             torch_dtype=torch.float16,
+                                             attn_implementation="flash_attention_2",
+                                             )
+model = torch.compile(model)
 #device_map = infer_auto_device_map(
 #    model,
 #    max_memory={1: "20GiB","cpu": "10GiB"},
@@ -93,18 +84,29 @@ model = AutoModelForCausalLM.from_pretrained(model_path,
 #device_map['model.lm_head'] = device_map['model.embed_tokens']
 #model = dispatch_model(model, device_map=device_map)
 print("加载Lora")
-model = PeftModel.from_pretrained(model,lora_path)
+#model = PeftModel.from_pretrained(model,lora_path)
 tokenizer = AutoTokenizer.from_pretrained(model_path, torch_dtype=torch.float16)
 
 model.eval()
-model.to("cuda:1")
+model.to("cuda")
 
-with open(r"chat_500.json",'r') as file:
+with open(r"chat_0.8M.json",'r') as file:
     data = json.loads(file.read())
+#获取打分进度
+data_old=[]
+if os.path.exists("chat_0.8M_encoded.json"):
+    with open("chat_0.8M_encoded.json",'r') as file:
+        data_old=json.loads(file.read())
+
 with Progress() as progress:
     main_task = progress.add_task("[green]数据集处理进度", total=len(data))
-    merged_history_list = [item for block in data for item in block["history"]]
+
     for block_index, block in enumerate(data):
+        if block_index < len(data_old):
+            data[block_index] = data_old[block_index]
+            progress.update(main_task, advance=1)
+            continue
+
         prompt = Prompt(tokenizer)
         probdiff = []
         probsum = []
@@ -142,5 +144,5 @@ with Progress() as progress:
             block["history"][history_index].append(probsum[history_index].item())
             block["history"][history_index].append(softmax_weight.tolist()[history_index])
 
-        with open(r"chat_500_hisw.json",'w') as file:
-            file.write(json.dumps(data,ensure_ascii=False))
+        with open(r"chat_0.8M_encoded.json",'w') as file:
+            file.write(json.dumps(data[:block_index],ensure_ascii=False))
